@@ -460,3 +460,388 @@ Bám sát các pattern hiện có:
 Triết lý **phân vai chặt + phản biện chéo + structured output ở tầng quyết
 định** giữ nguyên; chỉ thay nội dung tool, schema, và số chiều debate cho
 phù hợp với domain mới.
+
+---
+
+## Phần V — Token Economics & Kiến trúc tối ưu (LangChain/LangGraph + Claude)
+
+> Phần này trả lời 2 câu hỏi: **(a)** chạy đội agent này trên LangChain với
+> backend Claude tốn bao nhiêu token, **(b)** thiết kế kiến trúc thế nào để
+> mỗi khi đối tác nộp giải pháp mới chỉ phải trả "delta token" thay vì rerun
+> toàn bộ.
+
+### 1. Khung ước tính token
+
+Mỗi node trong graph tiêu token theo 3 thành phần:
+
+```
+T_node = T_system + T_context + T_history + T_tool_io   (input)
+       + T_output                                       (output)
+```
+
+| Thành phần | Mô tả | Đặc điểm tiêu thụ |
+|---|---|---|
+| `T_system` | System prompt cố định | Lặp lại mỗi lần gọi → **cache được** |
+| `T_context` | FIFA docs, standards, vendor catalog | Lặp lại trong cùng phiên → **cache được** |
+| `T_history` | Báo cáo các analyst trước + lịch sử debate | Tăng dần theo node → tốn nhất |
+| `T_tool_io` | Kết quả `web_search`, `fetch_doc` | Có thể rất lớn (PDF, spec) → cần *trim & retrieve* |
+| `T_output` | Báo cáo / luận điểm / schema | Phụ thuộc verbosity prompt |
+
+### 2. Baseline (chưa tối ưu) — 1 lần phân tích dự án sân vận động
+
+Giả định: 6 domain analyst, compliance, R&D-debate 3-way × 2 vòng (6 lượt),
+vendor mapping, risk-debate 4-way × 1 vòng (4 lượt), budget manager,
+executive editor.
+
+| Node | Input (tok) | Output (tok) | Ghi chú |
+|---|---:|---:|---|
+| 6 × Domain Analyst | 6 × 30k = 180k | 6 × 3k = 18k | Có tool-calling, ngữ cảnh là FIFA spec |
+| Standards Compliance | 60k | 4k | Đọc 6 báo cáo |
+| R&D Debate (6 lượt × 60k) | 360k | 12k | Mỗi lượt nhồi cả 6 báo cáo + history |
+| Vendor Mapping | 80k | 4k | Vendor catalog là bulk text |
+| Risk Debate (4 lượt × 80k) | 320k | 8k | Đọc cả vendor matrix |
+| Budget & Roadmap Manager | 120k | 5k | Tổng hợp chi tiết |
+| Executive Editor | 150k | 6k | White paper output |
+| **Tổng** | **~1.27 M** | **~57 k** | |
+
+**Chi phí baseline với một mô hình đồng nhất (giá tham chiếu Claude tháng
+2026, để xác minh trên trang pricing trước khi commit budget):**
+
+| Mô hình | Input $/M | Output $/M | Chi phí 1 dự án |
+|---|---:|---:|---:|
+| Claude Haiku 4.5 | $1 | $5 | ~$1.6 |
+| Claude Sonnet 4.6 | $3 | $15 | ~$4.7 |
+| Claude Opus 4.7 | $15 | $75 | ~$23.3 |
+
+**Hotspot:** debate là kẻ đốt token chính (~53% input cả run) vì mỗi lượt
+nhồi lại toàn bộ báo cáo. Đây chính là chỗ cần tối ưu mạnh nhất.
+
+### 3. Bảy lớp tối ưu (xếp theo ROI giảm dần)
+
+#### Lớp 1 — Prompt caching gốc của Anthropic (đòn bẩy lớn nhất)
+
+Anthropic hỗ trợ cache với `cache_control: {"type": "ephemeral"}` trên block
+content; cache hit chỉ tính **10% giá input thường**, cache write tính
+**125%**. TTL 5 phút (default) hoặc 1 giờ (opt-in).
+
+Đặt **cache breakpoint** sau system + FIFA docs + 6 báo cáo analyst →
+mọi lượt debate sau đó chỉ trả 10% giá cho phần *prefix*, chỉ trả full giá
+cho phần *history* mới phát sinh.
+
+```python
+# LangChain — ChatAnthropic
+from langchain_anthropic import ChatAnthropic
+
+llm = ChatAnthropic(model="claude-sonnet-4-6")
+messages = [
+    SystemMessage(content=[
+        {"type": "text", "text": SYSTEM_PROMPT},
+        {"type": "text", "text": FIFA_REFERENCE_BUNDLE,
+         "cache_control": {"type": "ephemeral"}},   # ← breakpoint
+    ]),
+    HumanMessage(content=[
+        {"type": "text", "text": COMBINED_ANALYST_REPORTS,
+         "cache_control": {"type": "ephemeral"}},   # ← breakpoint thứ 2
+        {"type": "text", "text": current_debate_history},   # phần "tươi"
+    ]),
+]
+```
+
+Hiệu ứng kỳ vọng: 6 lượt debate cùng đọc 200k token prefix → lượt 1 trả
+full, lượt 2-6 trả 10%. **Tiết kiệm ~70% input cho debate node**, giảm
+tổng input từ 1.27M → ~0.5M.
+
+#### Lớp 2 — Hierarchical summarization giữa các tầng
+
+Truyền **bản tóm 1-2k token** sang tầng kế thay vì nguyên báo cáo:
+
+```
+Domain Analyst (T1..T6)  →  full report 3k tok mỗi cái
+                ▼ summarize  (Haiku gọi nhanh)
+            6 × 500 tok summary = 3k tok
+                ▼
+        Standards Compliance đọc summary, chỉ retrieve fulltext khi cần
+```
+
+Áp dụng cho: input vào R&D Debate, vào Risk Debate. Bản fulltext giữ trong
+state nhưng *không nhồi prompt* — debate đọc summary; nếu cần trích chứng
+cứ chi tiết, agent gọi tool `fetch_full_report(T_idx)` (RAG nội bộ).
+
+Tiết kiệm: 60k → 6k context mỗi lượt debate → input debate giảm 10×.
+
+#### Lớp 3 — Retrieval-Augmented Generation cho catalog tĩnh
+
+FIFA Stadium Guidelines, IEC/ISO docs, vendor catalog là tài liệu *tĩnh,
+khổng lồ*. Index một lần vào vector store (Chroma/Qdrant/PGVector), agent
+truy vấn top-k chunk thay vì nhồi cả PDF.
+
+```
+fifa_docs/  →  embedding  →  vector store
+                                  │
+agent prompt: "FIFA lighting requirement for Cat.4 stadium" 
+                                  │
+                              top-3 chunks (1.5k tok)  →  prompt
+```
+
+Mỗi domain analyst tiết kiệm ~15-20k tok input mà không giảm chất lượng;
+giảm hallucination về spec.
+
+#### Lớp 4 — Model routing theo độ phức tạp (two/three-tier)
+
+Mượn pattern `deep_thinking_llm` vs `quick_thinking_llm` của TradingAgents
+(`graph/setup.py:78-87`), mở rộng 3 tầng:
+
+| Tier | Model | Dùng cho |
+|---|---|---|
+| **Cheap** | Haiku 4.5 | Domain analysts, summarization, tool-call orchestration, vendor lookup |
+| **Mid** | Sonnet 4.6 | Compliance, vendor mapping, R&D Debate, Risk Debate |
+| **Deep** | Opus 4.7 | Budget & Roadmap Manager, Executive Editor (kết luận có rating) |
+
+Phân bổ token typical sau khi áp tối ưu:
+
+| Tier | Input | Output | Chi phí |
+|---|---:|---:|---:|
+| Haiku | 200k | 25k | $0.32 |
+| Sonnet | 350k | 22k | $1.38 |
+| Opus | 90k | 11k | $2.18 |
+| **Tổng** | **640k** | **58k** | **~$3.88** |
+
+Với caching ở Lớp 1: cache-read input ~400k × 10% giá = đáng kể, **chi phí
+xuống ~$1.5–2.5 / dự án**.
+
+#### Lớp 5 — Map-reduce thay round-robin debate
+
+Round-robin (Bull → Bear → Bull) là tuần tự, mỗi lượt phải đọc lại lịch sử.
+**Map-reduce variant**:
+
+```
+round 1 (parallel):
+   Innovator   ─► luận điểm độc lập (đọc summary, không đọc bên kia)
+   Sceptic     ─► luận điểm độc lập
+   Pragmatist  ─► luận điểm độc lập
+                │
+                ▼  (reduce)
+   Synthesizer  ─► chỉ ra điểm xung đột thực sự (10-15 điểm)
+                │
+                ▼
+round 2 (parallel, focused):
+   3 agent chỉ tranh luận trên ~10 điểm xung đột (context nhỏ)
+```
+
+So với round-robin 6 lượt × 60k = 360k input, map-reduce: 3 × 30k + 1 × 50k
++ 3 × 20k = ~200k input, **giảm ~45%**. Thêm bonus là chạy được parallel →
+latency thấp hơn ~2-3×.
+
+#### Lớp 6 — Stop-condition sớm cho debate
+
+Trong `conditional_logic.py:46-55` debate dừng cứng theo `max_debate_rounds`.
+Thêm cơ chế **early stopping**:
+
+- Sau mỗi lượt, gọi judge LLM (Haiku, ngắn) trả `consensus_score ∈ [0,1]`.
+- Nếu `consensus_score > 0.85` → bỏ qua các vòng còn lại, đi thẳng tới
+  Research Manager.
+- Nếu `< 0.3` (debate đang phân kỳ) → bắt buộc thêm 1 vòng có "moderator
+  reframe".
+
+Trên các case có dữ liệu rõ, debate thường hội tụ sau vòng 1; cắt vòng 2-3
+tiết kiệm ~30-40% tokens cho ~50% case.
+
+#### Lớp 7 — Batch API (cho phân tích offline)
+
+Anthropic Message Batches API giảm **50% giá** cho job chấp nhận trễ ≤ 24h.
+Phù hợp với:
+- Re-analysis hàng loạt khi tiêu chuẩn FIFA cập nhật.
+- So sánh 50 vendor solutions cuối quý.
+- Reflection batch trên outcome dự án trong quá khứ.
+
+Workflow realtime của partner mới vẫn dùng API thường; batch API chỉ cho
+"sweep job".
+
+### 4. Workflow phân tích **incremental** khi đối tác nộp giải pháp mới
+
+Đây là use case chính bạn nêu: *"mỗi khi có giải pháp đối tác, đưa vào
+phân tích tổng thể, chi phí, rủi ro tích hợp, mở rộng tương lai"*.
+
+#### 4.1 Nguyên tắc
+
+**Không rerun cả pipeline.** Tách state thành 2 phần:
+
+```
+PROJECT_STATE (long-lived, cached, versioned)
+  ├─ fifa_reference_bundle      ─┐
+  ├─ standards_matrix            │  cache 1h
+  ├─ domain_reports[T1..T6]      │  với cache_control breakpoints
+  ├─ vendor_matrix (current)     │
+  └─ rolling_executive_summary  ─┘
+
+SOLUTION_DELTA  (transient, mỗi lần partner submit)
+  ├─ partner_id, solution_doc
+  ├─ classified_axes[T_i, T_j, ...]
+  ├─ delta_compliance
+  ├─ delta_vendor_diff
+  ├─ delta_debate_log
+  ├─ delta_risk_assessment
+  └─ delta_budget_impact
+```
+
+#### 4.2 Sub-graph "delta-analysis"
+
+```
+Partner submits solution
+        │
+        ▼
+[1] Solution Classifier (Haiku)
+        - Phân loại giải pháp thuộc trục T_i nào
+        - Output: tag set, độ liên đới T_j ≠ T_i
+        │
+        ▼
+[2] Spec Extractor (Haiku, tool-calling)
+        - Bóc spec, KPI, giá tham khảo, scope
+        - Cache PROJECT_STATE.fifa_reference_bundle
+        │
+        ▼
+[3] Compliance Delta (Sonnet)
+        - So với standards_matrix → flag pass/fail/unknown
+        │
+        ▼
+[4] Focused R&D Debate 3-way (Sonnet, 1 vòng map-reduce)
+        - Context CHỈ gồm: trục T_i + summary T_j liên đới (tổng <10k)
+        - 3 agent đánh giá so với incumbent solution trong vendor_matrix
+        │
+        ▼
+[5] Integration Risk Analyst (Sonnet)
+        - Tương thích với 5 trục còn lại?
+        - Vendor lock-in / cyber surface delta
+        - Backward compat với phase đã build
+        │
+        ▼
+[6] Budget Delta (Sonnet)
+        - CapEx delta, OpEx delta, payback delta
+        - Sensitivity ±20%
+        │
+        ▼
+[7] Future-proof Scoring (Sonnet)
+        - Roadmap 5y/10y compatibility
+        - Modularity, open-standard score
+        │
+        ▼
+[8] Executive Update (Opus)
+        - Update rolling_executive_summary
+        - Rating mới: Adopt/Pilot/Hold/Defer/Reject cho solution này
+        - Update vendor_matrix nếu Adopt
+```
+
+#### 4.3 Token cost của 1 lần delta analysis
+
+| Bước | Input | Output | Ghi chú |
+|---|---:|---:|---|
+| Classifier | 5k | 0.5k | Haiku |
+| Spec Extractor | 20k | 2k | Haiku, kèm tool |
+| Compliance Delta | 25k (cache hit) | 2k | Sonnet |
+| Focused Debate | 40k (cache hit lớn) | 3k | Sonnet, 1 vòng |
+| Integration Risk | 30k | 2k | Sonnet |
+| Budget Delta | 25k | 2k | Sonnet |
+| Future-proof | 20k | 1.5k | Sonnet |
+| Exec Update | 60k | 4k | Opus |
+| **Tổng** | **~225k** | **~17k** | |
+
+**Sau khi áp Lớp 1 caching (~70% prefix là cache-hit):**
+
+- Effective input: 75k full-priced + 150k × 10% = **90k tính giá**
+- Output: 17k
+- Chi phí với mix tier: **~$0.6 – 1.2 / 1 đối tác**
+
+So với rerun toàn bộ pipeline (~$3-5): **giảm 75-85%**.
+
+### 5. Dự phóng chi phí theo quy mô
+
+Giả sử 1 dự án sân:
+- 1 lần khởi tạo PROJECT_STATE (full pipeline).
+- 30 đối tác nộp giải pháp lần đầu trong giai đoạn DD.
+- 20 đối tác nộp lại bản revised.
+- 4 lần "sweep re-analysis" theo quý (batch API).
+
+| Hạng mục | # lần | Token in | Token out | Chi phí |
+|---|---:|---:|---:|---:|
+| Full pipeline khởi tạo (caching + multi-tier) | 1 | ~640k | ~58k | ~$2.5 |
+| Delta analysis lần đầu | 30 | 30 × 90k effective | 30 × 17k | ~$24 |
+| Delta analysis (revised, prefix cache nóng) | 20 | 20 × 60k eff | 20 × 12k | ~$12 |
+| Sweep re-analysis (batch -50%) | 4 | 4 × 400k eff | 4 × 30k | ~$8 |
+| **Tổng cho 1 dự án (1 năm)** | | | | **~$45–60** |
+
+**Không tối ưu: cùng kịch bản tốn ~$200-400.** Khi scale lên nhiều dự án
+sân (vd 5 sân hạng A song song), kiến trúc cache-friendly tiết kiệm hàng
+nghìn USD/năm.
+
+### 6. Lưu ý hiện thực hoá trên LangChain/LangGraph
+
+#### 6.1 Cache breakpoint với `ChatAnthropic`
+
+LangChain Anthropic adapter truyền `cache_control` qua content blocks.
+Đặt breakpoint **sau** khối tĩnh nhất; tối đa 4 breakpoint/request.
+
+#### 6.2 LangGraph state phải nhỏ
+
+State quá lớn → mỗi node nhận snapshot full → token explosion. Dùng
+**reducer + reference**:
+
+```python
+class ProjectState(TypedDict):
+    domain_report_refs: dict[str, str]   # path/URI, KHÔNG inline text
+    standards_matrix_ref: str
+    rolling_summary: str                  # cập nhật hierarchical
+    delta_solution_active: SolutionDelta # solution đang xử lý
+```
+
+Node nào cần fulltext thì gọi `load_ref()` → kéo từ object store; node
+khác chỉ giữ ref.
+
+#### 6.3 Persistence cho cache nóng
+
+Dùng `langgraph.checkpoint.sqlite.SqliteSaver` (đã có trong TradingAgents
+qua `graph/checkpointer.py`) để lưu state giữa các lần đối tác submit, để:
+- Cache prefix của Anthropic vẫn hiệu lực trong TTL.
+- Resume khi crash giữa delta analysis.
+
+#### 6.4 Vector store
+
+```python
+from langchain_chroma import Chroma
+from langchain_anthropic import AnthropicEmbeddings  # hoặc voyage/openai
+
+fifa_index = Chroma.from_documents(fifa_chunks, embeddings,
+                                    collection_name="fifa_v2026")
+vendor_index = Chroma.from_documents(vendor_chunks, embeddings,
+                                      collection_name="vendor_catalog")
+```
+
+Re-index khi: FIFA cập nhật bản mới, vendor cập nhật giá/spec; còn lại
+giữ nguyên → embedding cost amortize sau vài tháng.
+
+#### 6.5 Observability bắt buộc
+
+- **LangSmith** hoặc tự log: input/output tokens, cache_read_input_tokens,
+  cache_creation_input_tokens cho mỗi node.
+- Dashboard "$/dự án" và "$/đối tác" để phát hiện regression khi chỉnh
+  prompt.
+- Anthropic trả `usage.cache_read_input_tokens` và
+  `usage.cache_creation_input_tokens` trong mỗi response — log lại để biết
+  cache hit thực sự bao nhiêu %.
+
+### 7. Tóm tắt thiết kế
+
+| Quyết định | Lý do |
+|---|---|
+| Phân tách `PROJECT_STATE` (cache nóng) ↔ `SOLUTION_DELTA` (transient) | Mỗi đối tác mới chỉ trả "delta cost" |
+| Anthropic prompt caching ở 2 breakpoint | Đòn bẩy đơn lẻ tốt nhất, ~70% giảm cost cho debate |
+| Hierarchical summary giữa tầng | Cắt context debate 10× |
+| RAG cho FIFA/vendor catalog | Bỏ nhồi PDF, giảm hallucination |
+| Three-tier model routing | Cân bằng chất lượng / chi phí |
+| Map-reduce debate + early stop | Cắt 30-50% token debate |
+| Batch API cho sweep | Giảm 50% chi phí re-analysis định kỳ |
+| LangGraph state-by-reference | State nhẹ, không bloat snapshot |
+
+Với kiến trúc này, **chi phí biên cho 1 đối tác mới ~$0.6–1.2**, và **chi
+phí khởi tạo dự án ~$2-3** thay vì hàng chục USD nếu rerun thuần. Hệ
+thống sẵn sàng scale tới hàng trăm giải pháp đối tác trong vòng đời 1 dự
+án mà tổng cost vẫn dưới 3 chữ số USD.
